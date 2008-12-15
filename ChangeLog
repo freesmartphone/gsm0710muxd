@@ -1,39 +1,38 @@
-2008-12-06	Michael Lauer	<mickey@openmoko.org>
+2008-08-29	Michael Dietrich	<mdt@pyneo.org>
 
-	* Release as 0.9.2.1
+	* remove auto-detect-magic
+	* Change API to org.pyneo
 
-2008-12-05  Paul Fertser	<fercerpav@gmail.com>
+2008-06-16	Michael Dietrich	<mdt@pyneo.org>
 
-	* 0001-Fixed-a-bug-with-a-2048-sized-transfer-from-modem.patch
+	* dbus server now completly in vala
+	* move more logic into vala
+	* back to good old pyneo prject. gsm0710d is part of pyneo, not
+	  freesmartphone
 
-2008-09-16	Michael Lauer	<mickey@openmoko.org>
-
-	* Release as 0.9.2
-
-2008-05-03	Michael Dietrich	<mdt@emdete.de>
-
-	* work around logic channel 1 opening bug and try to reclaim it
-
-2008-04-28	Michael Dietrich	<mdt@emdete.de>
+2008-04-28	Michael Dietrich	<mdt@pyneo.org>
 
 	* marcel holtmanns patch applied
 	* error checks on snprintf
 	* auto detect pm path
 
+2008-04-28	Michael Dietrich	<mdt@pyneo.org>
+
+	* Add power management functions
+	* Improve stability
+
 2008-04-28	Michael Lauer	<mickey@openmoko.org>
 
-	* Add power management functions (emdete)
-	* Improve stability (emdete)
-	* Change API to org.freesmartphone.GSM.MUX
-	* Release as 0.9.1
+	* Change interface name to org.freesmartphone.GSM.MUX, Release as 0.9.1
 
 2008-03-28	Michael Lauer	<mickey@openmoko.org>
 
 	* Clean up build, release as 0.9.0
 
-2008-02-28	Michael Lauer	<mickey@openmoko.org>
+2008-02-28	Michael Dietrich	<mdt@pyneo.org>
 
 	* src/gsm0710muxd.c: catch up with device node changes in openmoko-kernel 2.6.24
+	* data/gsm0710muxd: reincarnate useful init.d script
 
 2008-02-17	Michael Lauer	<mickey@openmoko.org>
 
@@ -44,7 +43,8 @@
 
 	* configure.ac data/Makefile.am data/org.freedesktop.GSM.MUX.service.in:
 	ship dbus service file
-	* data/gsm0710muxd: remove useless init script, activation goes via dbus now
+	* data/gsm0710muxd: remove useless init script, activation goes
+	via dbus now
 
 2008-02-05	Michael Lauer	<mickey@openmoko.org>
 
@@ -53,3 +53,15 @@
 2008-01-15	Michael Lauer 	<mickey@openmoko.org>
 
 	* Autotoolize
+
+2007-08-01	Michael Dietrich	<mdt@pyneo.org>
+
+	* add dbus functionality
+
+2007-06-01	Michael Dietrich	<mdt@pyneo.org>
+
+	* simplify init code
+
+2007-04-01	Michael Dietrich	<mdt@pyneo.org>
+
+	* initial version

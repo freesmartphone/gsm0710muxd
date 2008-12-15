@@ -9,7 +9,7 @@
  * Modified March 2006 by Tuukka Karvonen <tkarvone@iki.fi>
  * Modified October 2006 by Vasiliy Novikov <vn@hotbox.ru>
  *
- * Copyright (C) 2008 M. Dietrich <mdt@emdete.de>
+ * Copyright (C) 2008 M. Dietrich <mdt@pyneo.org>
  *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public License
@@ -47,16 +47,13 @@
 #include <time.h>
 #include <unistd.h>
 #include <glib.h> // http://library.gnome.org/devel/glib/unstable/glib-core.html
-#include <dbus/dbus.h> // http://dbus.freedesktop.org/doc/dbus/libdbus-tutorial.html
-#include <dbus/dbus-glib.h> // http://dbus.freedesktop.org/doc/dbus-glib/
-DBusConnection* dbus_g_connection_get_connection(DBusGConnection *gconnection); // why isn't this in dbus-glib.h?
+#include "muxercontrol.h"
+
 // http://maemo.org/api_refs/4.0/dbus-glib/group__DBusGLibInternals.html#gfac56b6025a90951510d33423ff04120
 // http://wiki.bluez.org/wiki/HOWTO/DiscoveringDevices
 // http://dbus.freedesktop.org/doc/api/html/example-service_8c-source.html
 // ~/Source/openmoko/build/tmp/work/i686-linux/glib-2.0-native-2.12.4-r1/glib-2.12.4/tests/mainloop-test.c
 // http://www.linuxquestions.org/questions/linux-software-2/dbus-problem-505442/
-
-// dbus-send --system --print-reply --type=method_call --dest=org.pyneo.muxer /org/pyneo/Muxer org.freesmartphone.GSM.MUX.AllocChannel string:xxx
 
 ///////////////////////////////////////////////////////////////// defines
 #define LOG(lvl, f, ...) do{if(lvl<=syslog_level)syslog(lvl,"%s:%d:%s(): " f "\n", __FILE__, __LINE__, __FUNCTION__, ##__VA_ARGS__);}while(0)
@@ -114,6 +111,7 @@ DBusConnection* dbus_g_connection_get_connection(DBusGConnection *gconnection); 
 // enabled The value is in seconds
 #define GSM0710_POLLING_INTERVAL 5
 #define GSM0710_BUFFER_SIZE 2048
+#define WAKEUP "\x1a"
 
 ////////////////////////////////////////////////////// types
 //
@@ -149,7 +147,7 @@ typedef struct Channel
 	int opened;
 	unsigned char v24_signals;
 	char* ptsname;
-	char* origin;
+	char* purpose;
 	int remaining;
 	unsigned char *tmp;
 	guint g_source;
@@ -194,13 +192,13 @@ typedef struct Serial
  * tells how much free space there is in the buffer
  */
 //int gsm0710_buffer_free(GSM0710_Buffer *buf);
-#define gsm0710_buffer_free(buf) ((buf->readp > buf->writep) ? (buf->readp - buf->writep) : (GSM0710_BUFFER_SIZE - (buf->writep-buf->readp)) - 1)
+#define gsm0710_buffer_free(buf) ((buf->readp > buf->writep) ? (buf->readp - buf->writep) : (GSM0710_BUFFER_SIZE - (buf->writep-buf->readp)))
 
 ////////////////////////////////// constants & globals
 static unsigned char close_channel_cmd[] = { GSM0710_CONTROL_CLD | GSM0710_CR, GSM0710_EA | (0 << 1) };
 static unsigned char test_channel_cmd[] = { GSM0710_CONTROL_TEST | GSM0710_CR, GSM0710_EA | (6 << 1), 'P', 'I', 'N', 'G', '\r', '\n', };
 //static unsigned char psc_channel_cmd[] = { GSM0710_CONTROL_PSC | GSM0710_CR, GSM0710_EA | (0 << 1), };
-static unsigned char wakeup_sequence[] = { GSM0710_FRAME_FLAG, GSM0710_FRAME_FLAG, };
+static unsigned char wakeup_sequence[] = { GSM0710_FRAME_FLAG, };
 // crc table from gsm0710 spec
 static const unsigned char r_crctable[] = {//reversed, 8-bit, poly=0x07
 	0x00, 0x91, 0xE3, 0x72, 0x07, 0x96, 0xE4, 0x75, 0x0E, 0x9F, 0xED,
@@ -228,20 +226,18 @@ static const unsigned char r_crctable[] = {//reversed, 8-bit, poly=0x07
 	0x57, 0xC6, 0xB3, 0x22, 0x50, 0xC1, 0xBA, 0x2B, 0x59, 0xC8, 0xBD,
 	0x2C, 0x5E, 0xCF, };
 // config stuff
-static char* revision = "$Rev: 295 $";
+static char* revision = "$Rev$";
 static int no_daemon = 1;
 static int pin_code = -1;
 static int use_ping = 0;
 static int use_timeout = 0;
 static int syslog_level = LOG_INFO;
-static char* object_name = "/org/pyneo/Muxer";
 // serial io
 static Serial serial;
 // muxed io channels
 static Channel channellist[GSM0710_MAX_CHANNELS]; // remember: [0] is not used acticly because it's the control channel
 // some state
 static GMainLoop* main_loop = NULL;
-static DBusGConnection* g_conn = NULL;
 // +CMUX=<mode>[,<subset>[,<port_speed>[,<N1>[,<T1>[,<N2>[,<T2>[,<T3>[,<k>]]]]]]]]
 static int cmux_mode = 1;
 static int cmux_subset = 0;
@@ -367,7 +363,7 @@ static int syslogdump(
 		for (i = 0; i < 16; i++)
 			if (offset + i < length)
 			{
-				SYSCHECK(snprintf(buffer + off, sizeof(buffer) - off, "%c", (ptr[offset + i] < ' ') ? '.' : ptr[offset + i]));
+				SYSCHECK(snprintf(buffer + off, sizeof(buffer) - off, "%c", (ptr[offset + i] < ' ' || ptr[offset + i] > 127) ? '.' : ptr[offset + i]));
 				off = strlen(buffer);
 			}
 		offset += 16;
@@ -406,7 +402,7 @@ static int write_frame(
 //	do
 //	{
 		syslogdump(">s ", (unsigned char *)wakeup_sequence, sizeof(wakeup_sequence));
-		write(serial.fd, wakeup_sequence, sizeof(wakeup_sequence));
+		c = write(serial.fd, wakeup_sequence, sizeof(wakeup_sequence));
 //		SYSCHECK(tcdrain(serial.fd));
 //		fd_set rfds;
 //		FD_ZERO(&rfds);
@@ -522,6 +518,7 @@ static int handle_channel_data(
 
 static int logical_channel_close(Channel* channel)
 {
+	LOG(LOG_DEBUG, "Enter");
 	if (channel->g_source >= 0)
 		g_source_remove(channel->g_source);
 	channel->g_source = -1;
@@ -534,12 +531,13 @@ static int logical_channel_close(Channel* channel)
 	if (channel->tmp != NULL)
 		free(channel->tmp);
 	channel->tmp = NULL;
-	if (channel->origin != NULL)
-		free(channel->origin);
-	channel->origin = NULL;
+	if (channel->purpose != NULL)
+		free(channel->purpose);
+	channel->purpose = NULL;
 	channel->opened = 0;
 	channel->v24_signals = 0;
 	channel->remaining = 0;
+	LOG(LOG_DEBUG, "Leave");
 	return 0;
 }
 
@@ -551,7 +549,7 @@ static int logical_channel_init(Channel* channel, int id)
 	channel->g_source = -1;
 	channel->ptsname = NULL;
 	channel->tmp = NULL;
-	channel->origin = NULL;
+	channel->purpose = NULL;
 	return logical_channel_close(channel);
 }
 
@@ -596,8 +594,8 @@ gboolean pseudo_device_read(GIOChannel *source, GIOCondition condition, gpointer
 			write_frame(channel->id, NULL, 0, GSM0710_CONTROL_CLD | GSM0710_CR);
 		else
 			write_frame(channel->id, close_channel_cmd, 2, GSM0710_TYPE_UIH);
+		LOG(LOG_INFO, "Logical channel %d for %s closed", channel->id, channel->purpose);
 		logical_channel_close(channel);
-		LOG(LOG_INFO, "Logical channel %d for %s closed", channel->id, channel->origin);
 	}
 	else if (condition == G_IO_HUP)
 	{
@@ -605,8 +603,8 @@ gboolean pseudo_device_read(GIOChannel *source, GIOCondition condition, gpointer
 			write_frame(channel->id, NULL, 0, GSM0710_CONTROL_CLD | GSM0710_CR);
 		else
 			write_frame(channel->id, close_channel_cmd, 2, GSM0710_TYPE_UIH);
+		LOG(LOG_INFO, "Logical channel %d for %s closed", channel->id, channel->purpose);
 		logical_channel_close(channel);
-		LOG(LOG_INFO, "Logical channel %d for %s closed", channel->id, channel->origin);
 	}
 	LOG(LOG_DEBUG, "Leave");
 	return FALSE;
@@ -615,14 +613,14 @@ gboolean pseudo_device_read(GIOChannel *source, GIOCondition condition, gpointer
 static gboolean watchdog(gpointer data);
 static int close_devices();
 
-static gboolean c_get_power(const char* origin)
+gboolean c_get_power(const char* purpose)
 {
 	LOG(LOG_DEBUG, "Enter");
 	LOG(LOG_DEBUG, "Leave");
 	return serial.state != MUX_STATE_OFF;
 }
 
-static gboolean c_set_power(const char* origin, gboolean on)
+void c_set_power(const char* purpose, gboolean on)
 {
 	LOG(LOG_DEBUG, "Enter");
 	if (on)
@@ -631,7 +629,7 @@ static gboolean c_set_power(const char* origin, gboolean on)
 		{
 			LOG(LOG_INFO, "power on");
 			serial.state = MUX_STATE_OPENING;
-			watchdog(&serial);
+			serial.g_source_watchdog = g_timeout_add_seconds(5, watchdog, &serial); // let the dog watch every 5 sec
 		}
 		else
 			LOG(LOG_WARNING, "power on request received but was already on");
@@ -641,25 +639,15 @@ static gboolean c_set_power(const char* origin, gboolean on)
 		if (serial.state == MUX_STATE_MUXING)
 		{
 			LOG(LOG_INFO, "power off");
-			g_source_remove(serial.g_source_watchdog);
 			close_devices();
 		}
 		else
 			LOG(LOG_WARNING, "power off received but wasn't on/muxing");
 	}
 	LOG(LOG_DEBUG, "Leave");
-	return TRUE;
 }
 
-static gboolean c_reset_modem(const char* origin)
-{
-	LOG(LOG_DEBUG, "Enter");
-	LOG(LOG_INFO, "modem reset");
-	serial.state = MUX_STATE_CLOSING;				
-	return TRUE;
-}
-
-static gboolean c_alloc_channel(const char* origin, const char** name)
+const int c_alloc_channel(const char* purpose, char** url)
 {
 	LOG(LOG_DEBUG, "Enter");
 	int i;
@@ -668,7 +656,7 @@ static gboolean c_alloc_channel(const char* origin, const char** name)
 			if (channellist[i].fd < 0) // is this channel free?
 			{
 				LOG(LOG_DEBUG, "Found channel %d fd %d on %s", i, channellist[i].fd, channellist[i].devicename);
-				channellist[i].origin = strdup(origin);
+				channellist[i].purpose = strdup(purpose);
 				SYSCHECK(channellist[i].fd = open(channellist[i].devicename, O_RDWR | O_NONBLOCK)); //open devices
 				char* pts = ptsname(channellist[i].fd);
 				if (pts == NULL) SYSCHECK(-1);
@@ -690,96 +678,22 @@ static gboolean c_alloc_channel(const char* origin, const char** name)
 				channellist[i].g_source = g_io_add_watch(g_channel, G_IO_IN | G_IO_HUP, pseudo_device_read, channellist+i);
 				write_frame(i, NULL, 0, GSM0710_TYPE_SABM | GSM0710_PF);
 				LOG(LOG_INFO, "Connecting %s to virtual channel %d for %s on %s",
-					channellist[i].ptsname, channellist[i].id, channellist[i].origin, serial.devicename);
-				*name = strdup(channellist[i].ptsname);
-				return TRUE;
+					channellist[i].ptsname, channellist[i].id, channellist[i].purpose, serial.devicename);
+				*url = channellist[i].ptsname;
+				return 0;
 			}
 	LOG(LOG_WARNING, "not muxing or no free channel found");
-	return TRUE;
+	errno = ENOBUFS;
+	return -1;
 }
 
-static void my_log_handler(
+void g_log_handler(
 	const gchar *log_domain,
 	GLogLevelFlags log_level,
 	const gchar *message,
 	gpointer user_data)
 {
 	LOG(LOG_INFO, "%d %s %s", log_level, log_domain, message);
-}
-
-#include "muxercontrol.c"
-#include "mux-glue.h"
-
-static int dbus_init()
-{
-	g_log_set_handler(NULL, G_LOG_LEVEL_MASK, my_log_handler, NULL);
-	g_type_init();
-	g_log_set_always_fatal(G_LOG_LEVEL_WARNING);
-	GError* g_err = NULL;
-	g_conn = dbus_g_bus_get(DBUS_BUS_SYSTEM, &g_err);
-	if (g_err != NULL)
-	{
-		//g_printerr
-		LOG(LOG_ERR, "Connecting to system bus failed: %s", g_err->message);
-		g_error_free(g_err);
-		return -1;
-	}
-	GObject* obj = (GObject*)muxer_control_gen();
-	DBusError err;
-	memset(&err, 0, sizeof(err));
-	if (dbus_bus_request_name(dbus_g_connection_get_connection(g_conn), "org.pyneo.muxer", DBUS_NAME_FLAG_ALLOW_REPLACEMENT|DBUS_NAME_FLAG_REPLACE_EXISTING, &err) < 0)
-	{
-		if (dbus_error_is_set(&err))
-			LOG(LOG_ERR, "dbus error with dbus_bus_request_name '%s' '%s'", err.name, err.message);
-		else
-			LOG(LOG_ERR, "dbus error with dbus_bus_request_name");
-		return -1;
-	}
-	dbus_g_object_type_install_info(TYPE_MUXER_CONTROL, &dbus_glib_mux_object_info);
-	dbus_g_connection_register_g_object(g_conn, object_name, obj);
-	return 0;
-}
-
-static int dbus_deinit()
-{
-	if (g_conn)
-		dbus_g_connection_unref(g_conn);
-	return 0;
-}
-
-static int dbus_signal_send_deactivate(const char* sigvalue)
-{
-	DBusConnection* conn = dbus_g_connection_get_connection(g_conn);
-	if (NULL == conn)
-	{
-		LOG(LOG_ERR, "Connection null"); 
-		return -1;
-	}
-	DBusMessage* msg = dbus_message_new_signal(object_name, // object name of the signal
-		"org.freesmartphone.GSM.MUX", // interface name of the signal
-		"deactivate"); // name of the signal
-	if (NULL == msg) 
-	{ 
-		LOG(LOG_ERR, "Message Null"); 
-		return -1;
-	}
-	DBusMessageIter args;
-	dbus_message_iter_init_append(msg, &args); // append arguments onto signal
-	if (!dbus_message_iter_append_basic(&args, DBUS_TYPE_STRING, &sigvalue))
-	{ 
-		LOG(LOG_ERR, "Out Of Memory"); 
-		return -1;
-	}
-	dbus_uint32_t g_serial = 0; // unique number to associate replies with requests
-	if (!dbus_connection_send(conn, msg, &g_serial)) // send the message and flush the connection
-	{ 
-		LOG(LOG_ERR, "Out Of Memory"); 
-		return -1;
-	}
-	dbus_connection_flush(conn);
-	// free the message 
-	dbus_message_unref(msg);
-	return 0;
 }
 
 /**
@@ -1190,9 +1104,11 @@ static int chat(
 	int len;
 	int wrote = 0;
 	syslogdump(">s ", (unsigned char *) cmd, strlen(cmd));
+	SYSCHECK(wrote = write(serial_device_fd, WAKEUP, strlen(WAKEUP)));
+	usleep(50);
 	SYSCHECK(wrote = write(serial_device_fd, cmd, strlen(cmd)));
 	LOG(LOG_DEBUG, "Wrote %d bytes", wrote);
-	SYSCHECK(tcdrain(serial_device_fd));
+//	SYSCHECK(tcdrain(serial_device_fd));
 
 	fd_set rfds;
 	FD_ZERO(&rfds);
@@ -1224,6 +1140,7 @@ static int chat(
 			}
 		}
 	} while (sel);
+	errno = ETIMEDOUT;
 	return -1;
 }
 
@@ -1392,9 +1309,9 @@ int extract_frames(
 				LOG(LOG_DEBUG, "Frame is UA");
 				if (channellist[frame->channel].opened)
 				{
-					SYSCHECK(logical_channel_close(channellist+frame->channel));
 					LOG(LOG_INFO, "Logical channel %d for %s closed",
-						frame->channel, channellist[frame->channel].origin);
+						frame->channel, channellist[frame->channel].purpose);
+					SYSCHECK(logical_channel_close(channellist+frame->channel));
 				}
 				else
 				{
@@ -1413,9 +1330,9 @@ int extract_frames(
 			case GSM0710_TYPE_DM:
 				if (channellist[frame->channel].opened)
 				{
-					SYSCHECK(logical_channel_close(channellist+frame->channel));
 					LOG(LOG_INFO, "DM received, so the channel %d for %s was already closed",
-						frame->channel, channellist[frame->channel].origin);
+						frame->channel, channellist[frame->channel].purpose);
+					SYSCHECK(logical_channel_close(channellist+frame->channel));
 				}
 				else
 				{
@@ -1426,7 +1343,7 @@ int extract_frames(
 //close channels
 					}
 					else
-						LOG(LOG_INFO, "Logical channel %d for %s couldn't be opened", frame->channel, channellist[frame->channel].origin);
+						LOG(LOG_INFO, "Logical channel %d for %s couldn't be opened", frame->channel, channellist[frame->channel].purpose);
 				}
 				break;
 			case GSM0710_TYPE_DISC:
@@ -1440,13 +1357,13 @@ int extract_frames(
 						LOG(LOG_INFO, "Control channel closed");
 					}
 					else
-						LOG(LOG_INFO, "Logical channel %d for %s closed", frame->channel, channellist[frame->channel].origin);
+						LOG(LOG_INFO, "Logical channel %d for %s closed", frame->channel, channellist[frame->channel].purpose);
 				}
 				else
 				{
 //channel already closed
 					LOG(LOG_WARNING, "Received DISC even though channel %d for %s was already closed",
-							frame->channel, channellist[frame->channel].origin);
+							frame->channel, channellist[frame->channel].purpose);
 					write_frame(frame->channel, NULL, 0, GSM0710_TYPE_DM | GSM0710_PF);
 				}
 				break;
@@ -1458,12 +1375,12 @@ int extract_frames(
 						LOG(LOG_INFO, "Control channel opened");
 					else
 						LOG(LOG_INFO, "Logical channel %d for %s opened",
-							frame->channel, channellist[frame->channel].origin);
+							frame->channel, channellist[frame->channel].purpose);
 				}
 				else
 //channel already opened
 					LOG(LOG_WARNING, "Received SABM even though channel %d for %s was already closed",
-						frame->channel, channellist[frame->channel].origin);
+						frame->channel, channellist[frame->channel].purpose);
 				channellist[frame->channel].opened = 1;
 				write_frame(frame->channel, NULL, 0, GSM0710_TYPE_UA | GSM0710_PF);
 				break;
@@ -1542,7 +1459,7 @@ static int modem_hw_on(const char* pm_base_dir)
 	SYSCHECK(modem_hw_(pm_base_dir, "reset", 1));
 	sleep(1);
 	SYSCHECK(modem_hw_(pm_base_dir, "reset", 0));
-	sleep(4);
+	sleep(7);
 	LOG(LOG_DEBUG, "Leave");
 	return 0;
 }
@@ -1640,7 +1557,7 @@ int start_muxer(
 {
 	LOG(LOG_INFO, "Configuring modem");
 	char gsm_command[100];
-	if (chat(serial->fd, "\r\n\r\n\r\nAT\r\n", 1) < 0)
+	if (chat(serial->fd, "AT\r\n", 1) < 0)
 	{
 		LOG(LOG_WARNING, "Modem does not respond to AT commands, trying close mux mode");
 		//if (cmux_mode) we do not know now so write both
@@ -1684,6 +1601,7 @@ int start_muxer(
 		));
 	LOG(LOG_INFO, "Starting mux mode");
 	SYSCHECK(chat(serial->fd, gsm_command, 3));
+	muxer_trigger(1);
 	serial->state = MUX_STATE_MUXING;
 	LOG(LOG_INFO, "Waiting for mux-mode");
 	sleep(1);
@@ -1697,6 +1615,7 @@ int start_muxer(
 static int close_devices()
 {
 	LOG(LOG_DEBUG, "Enter");
+	g_source_remove(serial.g_source_watchdog);
 	g_source_remove(serial.g_source);
 	serial.g_source = -1;
 	int i;
@@ -1706,7 +1625,7 @@ static int close_devices()
 //the mux mode
 		if (channellist[i].fd >= 0)
 		{
-			SYSCHECK(dbus_signal_send_deactivate(channellist[i].ptsname));
+			//SYSCHECK(dbus_signal_send_deactivate(channellist[i].ptsname)); // TODO
 			if (channellist[i].opened)
 			{
 				LOG(LOG_INFO, "Closing down the logical channel %d", i);
@@ -1733,6 +1652,7 @@ static int close_devices()
 		serial.fd = -1;
 	}
 	SYSCHECK(modem_hw_off(serial.pm_base_dir));
+	muxer_trigger(0);
 	serial.state = MUX_STATE_OFF;
 	return 0;
 }
@@ -1747,7 +1667,6 @@ static gboolean watchdog(gpointer data)
 	case MUX_STATE_OPENING:
 		if (open_serial_device(serial) < 0)
 			LOG(LOG_WARNING, "Could not open all devices and start muxer");
-		serial->g_source_watchdog = g_timeout_add_seconds(5, watchdog, data); // let the dog watch every 5 sec
 		LOG(LOG_INFO, "Watchdog started");
 	case MUX_STATE_INITILIZING:
 		if (start_muxer(serial) < 0)
@@ -1829,7 +1748,7 @@ int main(
 	int opt;
 	pid_t parent_pid;
 //for fault tolerance
-	serial.devicename = "/dev/ttySAC0";
+	serial.devicename = "/dev/modem";
 	while ((opt = getopt(argc, argv, "dvs:t:p:f:h?m:b:P:x:")) > 0)
 	{
 		switch (opt)
@@ -1878,24 +1797,6 @@ int main(
 			break;
 		}
 	}
-	if (serial.pm_base_dir == NULL)
-	{
-		// auto detect - i hate windows-like-behavior but mickey want's it ;)
-		struct stat sb;
-		int i;
-		static char* fn[] = {
-			"/sys/bus/platform/devices/neo1973-pm-gsm.0",
-			"/sys/bus/platform/devices/gta01-pm-gsm.0",
-			NULL
-			};
-		for (i=0;fn[i];i++)
-			if (stat(fn[i], &sb) >= 0)
-			{
-				serial.pm_base_dir = fn[i];
-				LOG(LOG_INFO, "using '%s' as basedir for pm", fn[i]);
-				break;
-			}
-	}
 //daemonize show time
 	parent_pid = getpid();
 	if (!no_daemon && daemon(0, 0))
@@ -1915,7 +1816,6 @@ int main(
 		openlog(argv[0], LOG_NDELAY | LOG_PID | LOG_PERROR, LOG_LOCAL0);
 	else
 		openlog(argv[0], LOG_NDELAY | LOG_PID, LOG_LOCAL0);
-	SYSCHECK(dbus_init());
 //allocate memory for data structures
 	if ((serial.in_buf = gsm0710_buffer_init()) == NULL
 	 || (serial.adv_frame_buf = (unsigned char*)malloc((cmux_N1 + 3) * 2 + 2)) == NULL)
@@ -1925,19 +1825,16 @@ int main(
 	}
 	LOG(LOG_DEBUG, "%s %s starting", *argv, revision);
 //Initialize modem and virtual ports
-	serial.state = MUX_STATE_OPENING;
-	watchdog(&serial);
+	serial.state = MUX_STATE_OFF;
 //start waiting for input and forwarding it back and forth --
-	main_loop = g_main_loop_new(NULL, FALSE);
-	g_main_loop_run(main_loop); // will/may be terminated in signal_treatment
-	g_main_loop_unref(main_loop);
+	g_type_init();
+	SYSCHECK(muxer_run());
 //finalize everything
 	SYSCHECK(close_devices());
 	free(serial.adv_frame_buf);
 	gsm0710_buffer_destroy(serial.in_buf);
 	LOG(LOG_INFO, "Received %ld frames and dropped %ld received frames during the mux-mode",
 		serial.in_buf->received_count, serial.in_buf->dropped_count);
-	SYSCHECK(dbus_deinit());
 	LOG(LOG_DEBUG, "%s finished", argv[0]);
 	closelog();// close syslog
 	return 0;

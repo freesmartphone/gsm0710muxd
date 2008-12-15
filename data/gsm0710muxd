@@ -1,13 +1,19 @@
 #!/bin/sh -e
 NAME=gsm0710muxd
-SYSROOTOPT="-x /sys/bus/platform/devices/neo1973-pm-gsm.0"
+DEBUG=""
 case "$1" in
 	start)
+		echo -n "starting $NAME: "
 		start-stop-daemon --start --pidfile /var/run/${NAME}.pid \
 		--make-pidfile --background --startas /usr/sbin/$NAME -- \
-		$SYSROOTOPT -f 100
+			-x /sys/bus/platform/devices/neo1973-pm-gsm.0 \
+			-f 100 \
+			-s /dev/ttySAC0 \
+			$DEBUG
+		echo "started process with pid `cat /var/run/${NAME}.pid`"
 	;;
 	stop)
+		echo -n "stopping $NAME: "
 		start-stop-daemon --stop --pidfile /var/run/${NAME}.pid \
 		--oknodo
 		rm -f /var/run/${NAME}.pid

@@ -1,6 +1,8 @@
 dbusdir = $(sysconfdir)/dbus-1/system.d
+initdir = $(sysconfdir)/init.d
 
 dist_dbus_DATA = gsm0710muxd.conf
+dist_init_DATA = gsm0710muxd
 
 servicedir = $(datadir)/dbus-1/system-services
 
