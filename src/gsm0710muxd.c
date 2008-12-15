@@ -56,11 +56,22 @@
 // http://www.linuxquestions.org/questions/linux-software-2/dbus-problem-505442/
 
 ///////////////////////////////////////////////////////////////// defines
-#define LOG(lvl, f, ...) do{if(lvl<=syslog_level)syslog(lvl,"%s:%d:%s(): " f "\n", __FILE__, __LINE__, __FUNCTION__, ##__VA_ARGS__);}while(0)
-#define SYSCHECK(c) do{if((c)<0){\
- LOG(LOG_ERR, "system-error: '%s' (code: %d)", strerror(errno), errno);\
- return -1;\
- }}while(0)
+#define LOG(lvl, f, ...) do{\
+	if(lvl<=syslog_level){\
+		if (mylogfile){\
+			fprintf(mylogfile,"%s:%d: [%d] %s(): " f "\n", __FILE__, __LINE__, lvl, __FUNCTION__, ##__VA_ARGS__);\
+			fflush(mylogfile);\
+		}else{\
+			syslog(lvl,"%s:%d:%s(): " f "\n", __FILE__, __LINE__, __FUNCTION__, ##__VA_ARGS__);\
+	}}}while(0)
+
+#define SYSCHECK(c) do{\
+		if((c)<0){\
+			LOG(LOG_ERR, "system-error: '%s' (code: %d)", strerror(errno), errno);\
+			return -1;\
+		}\
+	}while(0)
+
 #define GSM0710_FRAME_FLAG 0xF9// basic mode flag for frame start and end
 #define GSM0710_FRAME_ADV_FLAG 0x7E// advanced mode flag for frame start and end
 #define GSM0710_FRAME_ADV_ESC 0x7D// advanced mode escape symbol
@@ -177,6 +188,15 @@ typedef struct Serial
 	guint g_source_watchdog;
 } Serial;
 
+typedef enum AdditionFunctionality {
+	AF_NONE = 0,
+	AF_WAKEUP_WITH_SYSFS = 1,
+	AF_WAKEUP_WITH_SEQUENCE = 2,
+	AF_SIEMENS_C35 = 4,
+	AF_ENFORA = 8,
+	AF_SHORT_INIT = 16,
+} AdditionFunctionality;
+
 /////////////////////////////////////////// function prototypes
 /**
  * increases buffer pointer by one and wraps around if necessary
@@ -187,12 +207,16 @@ typedef struct Serial
  * Tells how many chars are saved into the buffer.
  */
 //int gsm0710_buffer_length(GSM0710_Buffer *buf);
-#define gsm0710_buffer_length(buf) ((buf->readp > buf->writep) ? (GSM0710_BUFFER_SIZE - (buf->readp - buf->writep)) : (buf->writep-buf->readp))
+#define gsm0710_buffer_length(buf) ((buf->readp > buf->writep) ? \
+	(GSM0710_BUFFER_SIZE - (buf->readp - buf->writep)) : \
+	(buf->writep-buf->readp))
 /**
  * tells how much free space there is in the buffer
  */
 //int gsm0710_buffer_free(GSM0710_Buffer *buf);
-#define gsm0710_buffer_free(buf) ((buf->readp > buf->writep) ? (buf->readp - buf->writep) : (GSM0710_BUFFER_SIZE - (buf->writep-buf->readp)))
+#define gsm0710_buffer_free(buf) ((buf->readp > buf->writep) ? \
+	(buf->readp - buf->writep) : \
+	(GSM0710_BUFFER_SIZE - (buf->writep-buf->readp)) - 1)
 
 ////////////////////////////////// constants & globals
 static unsigned char close_channel_cmd[] = { GSM0710_CONTROL_CLD | GSM0710_CR, GSM0710_EA | (0 << 1) };
@@ -226,22 +250,22 @@ static const unsigned char r_crctable[] = {//reversed, 8-bit, poly=0x07
 	0x57, 0xC6, 0xB3, 0x22, 0x50, 0xC1, 0xBA, 0x2B, 0x59, 0xC8, 0xBD,
 	0x2C, 0x5E, 0xCF, };
 // config stuff
-static char* revision = "$Rev$";
 static int no_daemon = 1;
 static int pin_code = -1;
+static AdditionFunctionality additional_functionality = 0;
 static int use_ping = 0;
 static int use_timeout = 0;
+static FILE * mylogfile;
 static int syslog_level = LOG_INFO;
 // serial io
 static Serial serial;
 // muxed io channels
 static Channel channellist[GSM0710_MAX_CHANNELS]; // remember: [0] is not used acticly because it's the control channel
-// some state
-static GMainLoop* main_loop = NULL;
 // +CMUX=<mode>[,<subset>[,<port_speed>[,<N1>[,<T1>[,<N2>[,<T2>[,<T3>[,<k>]]]]]]]]
 static int cmux_mode = 1;
 static int cmux_subset = 0;
 static int cmux_port_speed = 5;
+static int at_port_speed = 5;
 // Maximum Frame Size (N1): 64/31
 static int cmux_N1 = 64;
 #if 0
@@ -258,7 +282,6 @@ static int cmux_k = 2;
 #endif
 // TODO: set automatically from at+cmux=?
 // neo: +CMUX: (1),(0),(1-5),(10-100),(1-255),(0-100),(2-255),(1-255),(1-7)
-
 /*
  * The following arrays must have equal length and the values must
  * correspond. also it has to correspond to the gsm0710 spec regarding
@@ -270,6 +293,7 @@ static int baud_rates[] = {
 static speed_t baud_bits[] = {
 	0, B9600, B19200, B38400, B57600, B115200, B230400, B460800
 };
+int uih_pf_bit_received = 0;
 
 /**
  * Determine baud-rate index for CMUX command
@@ -372,6 +396,25 @@ static int syslogdump(
 	return 0;
 }
 
+static int modem_hw_(const char* pm_base_dir, const char* entry, int on)
+{
+	LOG(LOG_DEBUG, "Enter");
+	if (pm_base_dir != NULL)
+	{
+		char fn[256];
+		SYSCHECK(snprintf(fn, sizeof(fn), "%s/%s", pm_base_dir, entry));
+		LOG(LOG_DEBUG, "echo %c > %s", on?'1':'0', fn);
+		int fd;
+		SYSCHECK(fd = open(fn, O_RDWR | O_NONBLOCK));
+		SYSCHECK(write(fd, on?"1\n":"0\n", 2));
+		SYSCHECK(close(fd));
+	}
+	else
+		LOG(LOG_DEBUG, "no pm_base_dir");
+	LOG(LOG_DEBUG, "Leave");
+	return 0;
+}
+
 /**
  * Writes a frame to a logical channel. C/R bit is set to 1.
  * Doesn't support FCS counting for GSM0710_TYPE_UI frames.
@@ -397,6 +440,10 @@ static int write_frame(
 	unsigned char postfix[2] = { 0xFF, GSM0710_FRAME_FLAG };
 	int prefix_length = 4;
 	int c;
+	if (additional_functionality & AF_WAKEUP_WITH_SYSFS)
+		modem_hw_(serial.pm_base_dir, "wake", 1);
+	else if (additional_functionality & AF_WAKEUP_WITH_SEQUENCE)
+	{
 //	char w = 0;
 //	int count = 0;
 //	do
@@ -418,11 +465,23 @@ static int write_frame(
 //	} while (w != wakeup_sequence[0] && count < cmux_N2);
 //	if (w != wakeup_sequence[0])
 //		LOG(LOG_WARNING, "Didn't get frame-flag after wakeup");
+	}
 	LOG(LOG_DEBUG, "Sending frame to channel %d", channel);
 //GSM0710_EA=1, Command, let's add address
 	prefix[1] = prefix[1] | ((63 & (unsigned char) channel) << 2);
 //let's set control field
 	prefix[2] = type;
+	if (additional_functionality & AF_ENFORA)
+	{
+		if ((type ==  GSM0710_TYPE_UIH || type ==  GSM0710_TYPE_UI) && 
+			uih_pf_bit_received == 1 && 
+			GSM0710_COMMAND_IS(input[0], GSM0710_CONTROL_MSC))
+		{
+			prefix[2] |= GSM0710_PF; //Set the P/F bit in Response if Command from modem had it set
+			uih_pf_bit_received = 0; //Reset the variable, so it is ready for next command
+			LOG(LOG_DEBUG, "uih_pf_bit_received is %d", uih_pf_bit_received );
+		}
+	}
 //let's not use too big frames
 	length = min(cmux_N1, length);
 	if (!cmux_mode)
@@ -484,6 +543,8 @@ static int write_frame(
 			return 0;
 		}
 	}
+	if (additional_functionality & AF_WAKEUP_WITH_SYSFS)
+		modem_hw_(serial.pm_base_dir, "wake", 0);
 	LOG(LOG_DEBUG, "Leave");
 	return length;
 }
@@ -1138,6 +1199,11 @@ static int chat(
 				LOG(LOG_DEBUG, "Received ERROR");
 				return -1;
 			}
+			if (memstr((char *) buf, len, "*MRDY: 1"))
+			{
+				LOG(LOG_DEBUG, "Received *MRDY: 1");
+				return 0;
+			}
 		}
 	} while (sel);
 	errno = ETIMEDOUT;
@@ -1253,6 +1319,21 @@ static int handle_command(
 //acknowledge the command
 				frame->data[0] = frame->data[0] & ~GSM0710_CR;
 				write_frame(0, frame->data, frame->length, GSM0710_TYPE_UIH);
+				if (additional_functionality & AF_ENFORA)
+				{
+					switch ((type & ~GSM0710_CR)){
+					case GSM0710_CONTROL_MSC:
+						if (frame->control & GSM0710_PF){ //Check if the P/F var needs to be set again (cleared in write_frame)
+						uih_pf_bit_received = 1;
+						}
+						LOG(LOG_DEBUG, "Sending 1st MSC command App->Modem");
+						frame->data[0] = frame->data[0] | GSM0710_CR; //setting the C/R bit to "command"
+						write_frame(0, frame->data, frame->length, GSM0710_TYPE_UIH);
+						break;
+					default:
+						break;
+					}
+				}
 			}
 		}
 		else
@@ -1286,6 +1367,12 @@ int extract_frames(
 		if ((GSM0710_FRAME_IS(GSM0710_TYPE_UI, frame) || GSM0710_FRAME_IS(GSM0710_TYPE_UIH, frame)))
 		{
 			LOG(LOG_DEBUG, "Frame is UI or UIH");
+			if (additional_functionality & AF_ENFORA)
+			{
+				if (frame->control & GSM0710_PF){
+				uih_pf_bit_received = 1;
+				}
+			}
 			if (frame->channel > 0)
 			{
 				LOG(LOG_DEBUG, "Frame channel > 0, pseudo channel");
@@ -1405,14 +1492,14 @@ void signal_treatment(
 		exit(0);
 	break;
 	case SIGHUP:
-//reread the configuration files
+		//reread the configuration files
 	break;
 	case SIGINT:
 	case SIGTERM:
 	case SIGUSR1:
-		//exit(0);
-//sig_term(param);
-		g_main_loop_quit(main_loop);
+		//g_main_loop_quit(main_loop);
+		exit(0);
+		//sig_term(param);
 	break;
 	case SIGKILL:
 	default:
@@ -1421,30 +1508,11 @@ void signal_treatment(
 	}
 }
 
-static int modem_hw_(const char* pm_base_dir, const char* entry, int on)
-{
-	LOG(LOG_DEBUG, "Enter");
-	if (pm_base_dir != NULL)
-	{
-		char fn[256];
-		SYSCHECK(snprintf(fn, sizeof(fn), "%s/%s", pm_base_dir, entry));
-		LOG(LOG_DEBUG, "echo %c > %s", on?'1':'0', fn);
-		int fd;
-		SYSCHECK(fd = open(fn, O_RDWR | O_NONBLOCK));
-		SYSCHECK(write(fd, on?"1\n":"0\n", 2));
-		SYSCHECK(close(fd));
-	}
-	else
-		LOG(LOG_DEBUG, "no pm_base_dir");
-	LOG(LOG_DEBUG, "Leave");
-	return 0;
-}
-
 static int modem_hw_off(const char* pm_base_dir)
 {
 	LOG(LOG_DEBUG, "Enter");
 	SYSCHECK(modem_hw_(pm_base_dir, "power_on", 0));
-	SYSCHECK(modem_hw_(pm_base_dir, "reset", 0));
+	modem_hw_(pm_base_dir, "reset", 0);
 	LOG(LOG_DEBUG, "Leave");
 	return 0;
 }
@@ -1456,9 +1524,11 @@ static int modem_hw_on(const char* pm_base_dir)
 	sleep(1);
 	SYSCHECK(modem_hw_(pm_base_dir, "power_on", 1));
 	sleep(1);
-	SYSCHECK(modem_hw_(pm_base_dir, "reset", 1));
-	sleep(1);
-	SYSCHECK(modem_hw_(pm_base_dir, "reset", 0));
+	if (modem_hw_(pm_base_dir, "reset", 1) == 0)
+	{
+		sleep(1);
+		SYSCHECK(modem_hw_(pm_base_dir, "reset", 0));
+	}
 	sleep(7);
 	LOG(LOG_DEBUG, "Leave");
 	return 0;
@@ -1538,7 +1608,7 @@ int open_serial_device(
 	t.c_cc[VSTART] = _POSIX_VDISABLE;
 	t.c_cc[VSTOP] = _POSIX_VDISABLE;
 	t.c_cc[VSUSP] = _POSIX_VDISABLE;
-	speed_t speed = baud_bits[cmux_port_speed];
+	speed_t speed = baud_bits[at_port_speed];
 	cfsetispeed(&t, speed);
 	cfsetospeed(&t, speed);
 	SYSCHECK(tcsetattr(serial->fd, TCSANOW, &t));
@@ -1568,7 +1638,7 @@ int start_muxer(
 	}
 	SYSCHECK(chat(serial->fd, "ATZ\r\n", 3));
 	SYSCHECK(chat(serial->fd, "ATE0\r\n", 1));
-	if (0)// additional siemens c35 init
+	if (additional_functionality & AF_SIEMENS_C35)// additional siemens c35 init
 	{
 		SYSCHECK(snprintf(gsm_command, sizeof(gsm_command), "AT+IPR=%d\r\n", baud_rates[cmux_port_speed]));
 		SYSCHECK(chat(serial->fd, gsm_command, 1));
@@ -1576,7 +1646,6 @@ int start_muxer(
 		SYSCHECK(chat(serial->fd, "AT&S0\r\n", 1));
 		SYSCHECK(chat(serial->fd, "AT\\Q3\r\n", 1));
 	}
-	//SYSCHECK(chat(serial->fd, "AT+CMUX=?\r\n", 1));
 	if (pin_code >= 0)
 	{
 		LOG(LOG_DEBUG, "send pin %04d", pin_code);
@@ -1585,20 +1654,26 @@ int start_muxer(
 		SYSCHECK(snprintf(gsm_command, sizeof(gsm_command), "AT+CPIN=%04d\r\n", pin_code));
 		SYSCHECK(chat(serial->fd, gsm_command, 10));
 	}
-	SYSCHECK(chat(serial->fd, "AT+CFUN=0\r\n", 10));
-	SYSCHECK(snprintf(gsm_command, sizeof(gsm_command), "AT+CMUX=%d,%d,%d,%d"
-		//",%d,%d,%d,%d,%d"
-		"\r\n"
-		, cmux_mode
-		, cmux_subset
-		, cmux_port_speed
-		, cmux_N1
-		//, cmux_T1
-		//, cmux_N2
-		//, cmux_T2
-		//, cmux_T3
-		//, cmux_k
-		));
+	if (additional_functionality & AF_SHORT_INIT)
+		SYSCHECK(snprintf(gsm_command, sizeof(gsm_command), "AT+CMUX=1\r\n"));
+	else
+	{
+		LOG(LOG_INFO, "Switching modem on");
+		SYSCHECK(chat(serial->fd, "AT+CFUN=0\r\n", 10));
+		SYSCHECK(snprintf(gsm_command, sizeof(gsm_command), "AT+CMUX=%d,%d,%d,%d"
+			//",%d,%d,%d,%d,%d"
+			"\r\n"
+			, cmux_mode
+			, cmux_subset
+			, cmux_port_speed
+			, cmux_N1
+			//, cmux_T1
+			//, cmux_N2
+			//, cmux_T2
+			//, cmux_T3
+			//, cmux_k
+			));
+	}
 	LOG(LOG_INFO, "Starting mux mode");
 	SYSCHECK(chat(serial->fd, gsm_command, 3));
 	muxer_trigger(1);
@@ -1719,20 +1794,23 @@ static int usage(
 	fprintf(stderr, "\tUsage: %s [options]\n", _name);
 	fprintf(stderr, "Options:\n");
 	// process control
-	fprintf(stderr, "\t-d: Fork, get a daemon [%s]\n", no_daemon?"no":"yes");
-	fprintf(stderr, "\t-v: verbose logging\n");
+	fprintf(stderr, "\t-d:\tFork, get a daemon [%s]\n", no_daemon?"no":"yes");
+	fprintf(stderr, "\t-v:\tverboser logging\n");
 	// modem control
-	fprintf(stderr, "\t-s <serial port name>: Serial port device to connect to [%s]\n", serial.devicename);
-	fprintf(stderr, "\t-t <timeout>: reset modem after this number of seconds of silence [%d]\n", use_timeout);
-	fprintf(stderr, "\t-P <pin-code>: PIN code to unlock SIM [%d]\n", pin_code);
-	fprintf(stderr, "\t-p <number>: use ping and reset modem after this number of unanswered pings [%d]\n", use_ping);
-	fprintf(stderr, "\t-x <dir>: power managment base dir [%s]\n", serial.pm_base_dir?serial.pm_base_dir:"<not set>");
+	fprintf(stderr, "\t-s <serial port name>:\tSerial port device to connect to [%s]\n", serial.devicename);
+	fprintf(stderr, "\t-t <timeout>:\treset modem after this number of seconds of silence [%d]\n", use_timeout);
+	fprintf(stderr, "\t-P <pin-code>:\tPIN code to unlock SIM [%d]\n", pin_code);
+	fprintf(stderr, "\t-p <number>:\tuse ping and reset modem after this number of unanswered pings [%d]\n", use_ping);
+	fprintf(stderr, "\t-l <filename>:\tset logfile name [<not set>]\n");
+	fprintf(stderr, "\t-x <dir>:\tpower managment base dir [%s]\n", serial.pm_base_dir?serial.pm_base_dir:"<not set>");
+	fprintf(stderr, "\t-a <mode>:\tadditional_functionality [%d]\n", additional_functionality);
 	// legacy - will be removed
-	fprintf(stderr, "\t-b <baudrate>: mode baudrate [%d]\n", baud_rates[cmux_port_speed]);
-	fprintf(stderr, "\t-m <modem>: Mode (basic, advanced) [%s]\n", cmux_mode?"advanced":"basic");
-	fprintf(stderr, "\t-f <framsize>: Frame size [%d]\n", cmux_N1);
+	fprintf(stderr, "\t-b <baudrate>:\tmuxer-mode baudrate [%d]\n", baud_rates[cmux_port_speed]);
+	fprintf(stderr, "\t-B <baudrate>:\tserial port baudrate [%d]\n", baud_rates[at_port_speed]);
+	fprintf(stderr, "\t-m <modem>:\tMode (basic, advanced) [%s]\n", cmux_mode?"advanced":"basic");
+	fprintf(stderr, "\t-f <framsize>:\tFrame size [%d]\n", cmux_N1);
 	//
-	fprintf(stderr, "\t-h: Show this help message and show current settings.\n");
+	fprintf(stderr, "\t-h:\tShow this help message and show current settings.\n");
 	return -1;
 }
 
@@ -1749,7 +1827,7 @@ int main(
 	pid_t parent_pid;
 //for fault tolerance
 	serial.devicename = "/dev/modem";
-	while ((opt = getopt(argc, argv, "dvs:t:p:f:h?m:b:P:x:")) > 0)
+	while ((opt = getopt(argc, argv, "dvs:t:p:f:h?m:b:B:P:a:x:")) > 0)
 	{
 		switch (opt)
 		{
@@ -1761,6 +1839,10 @@ int main(
 			break;
 		case 'x':
 			serial.pm_base_dir = optarg;
+			break;
+		case 'l':
+			mylogfile = fopen(optarg, "w+");
+			if (!mylogfile) SYSCHECK(-1);
 			break;
 		case 's':
 			serial.devicename = optarg;
@@ -1786,8 +1868,14 @@ int main(
 			else
 				cmux_mode = 0;
 			break;
+		case 'a':
+			additional_functionality = atoi(optarg);
+			break;
 		case 'b':
 			cmux_port_speed = baud_rate_index(atoi(optarg));
+			break;
+		case 'B':
+			at_port_speed = baud_rate_index(atoi(optarg));
 			break;
 		default:
 		case '?':
@@ -1823,7 +1911,7 @@ int main(
 		LOG(LOG_ALERT, "Out of memory");
 		exit(-1);
 	}
-	LOG(LOG_DEBUG, "%s %s starting", *argv, revision);
+	LOG(LOG_DEBUG, "%s starting", *argv);
 //Initialize modem and virtual ports
 	serial.state = MUX_STATE_OFF;
 //start waiting for input and forwarding it back and forth --

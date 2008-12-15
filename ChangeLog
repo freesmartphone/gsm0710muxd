@@ -1,3 +1,10 @@
+2008-12-15	Michael Dietrich	<mdt@pyneo.org>
+
+	* fix buffer underrun (thanks to Paul Fertser)
+	* additional functionality for enfora chip (thanks to Gonzalo Garcia and his team)
+	* added logging to file (also from Gonzalo Garcia)
+	* fixed core in signal handling
+
 2008-08-29	Michael Dietrich	<mdt@pyneo.org>
 
 	* remove auto-detect-magic

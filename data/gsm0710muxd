@@ -2,11 +2,21 @@
 NAME=gsm0710muxd
 DEBUG=""
 case "$1" in
+	run)
+		echo "running $NAME: "
+		/usr/sbin/$NAME \
+			-x /sys/bus/platform/devices/neo1973-pm-gsm.0 \
+			-a 2 \
+			-f 100 \
+			-s /dev/ttySAC0 \
+			$DEBUG
+	;;
 	start)
 		echo -n "starting $NAME: "
 		start-stop-daemon --start --pidfile /var/run/${NAME}.pid \
 		--make-pidfile --background --startas /usr/sbin/$NAME -- \
 			-x /sys/bus/platform/devices/neo1973-pm-gsm.0 \
+			-a 2 \
 			-f 100 \
 			-s /dev/ttySAC0 \
 			$DEBUG
