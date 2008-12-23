@@ -162,6 +162,7 @@ typedef struct Channel
 	int remaining;
 	unsigned char *tmp;
 	guint g_source;
+	GIOChannel* g_channel;
 } Channel;
 
 typedef enum MuxerStates 
@@ -735,8 +736,8 @@ const int c_alloc_channel(const char* purpose, char** url)
 					SYSCHECK(unlockpt(channellist[i].fd));
 				}
 				channellist[i].v24_signals = GSM0710_SIGNAL_DV | GSM0710_SIGNAL_RTR | GSM0710_SIGNAL_RTC | GSM0710_EA;
-				GIOChannel* g_channel = g_io_channel_unix_new(channellist[i].fd);
-				channellist[i].g_source = g_io_add_watch(g_channel, G_IO_IN | G_IO_HUP, pseudo_device_read, channellist+i);
+				channellist[i].g_channel = g_io_channel_unix_new(channellist[i].fd);
+				channellist[i].g_source = g_io_add_watch(channellist[i].g_channel, G_IO_IN | G_IO_HUP, pseudo_device_read, channellist+i);
 				write_frame(i, NULL, 0, GSM0710_TYPE_SABM | GSM0710_PF);
 				LOG(LOG_INFO, "Connecting %s to virtual channel %d for %s on %s",
 					channellist[i].ptsname, channellist[i].id, channellist[i].purpose, serial.devicename);
@@ -1377,7 +1378,11 @@ int extract_frames(
 			{
 				LOG(LOG_DEBUG, "Frame channel > 0, pseudo channel");
 //data from logical channel
-				write(channellist[frame->channel].fd, frame->data, frame->length);
+				int c;
+				SYSCHECK(c = write(channellist[frame->channel].fd, frame->data, frame->length));
+				if (c != frame->length)
+					LOG(LOG_WARNING, "Couldn't write all data to the pseudo channel %d. Wrote only %d bytes",
+						frame->channel, c);
 			}
 			else
 			{
@@ -1406,9 +1411,12 @@ int extract_frames(
 					if (frame->channel == 0)
 					{
 						LOG(LOG_DEBUG, "Control channel opened");
+						if (additional_functionality & AF_SIEMENS_C35)// additional siemens c35 test
+						{
 						//send version Siemens version test
-						//static unsigned char version_test[] = "\x23\x21\x04TEMUXVERSION2\0";
-						//write_frame(0, version_test, sizeof(version_test), GSM0710_TYPE_UIH);
+							static unsigned char version_test[] = "\x23\x21\x04TEMUXVERSION2\0";
+							write_frame(0, version_test, sizeof(version_test), GSM0710_TYPE_UIH);
+						}
 					}
 					else
 						LOG(LOG_INFO, "Logical channel %d opened", frame->channel);
